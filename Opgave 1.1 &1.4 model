@@ -1,0 +1,579 @@
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(dplyr)
+library(randomForest)
+library(ggplot2)
+library(stringr)
+library(pROC)
+library(ggsoccer)
+library(xgboost)
+library(themis)
+library(RMariaDB)
+
+# Opret forbindelse til databasen
+con <- dbConnect(
+  drv = MariaDB(),
+  dbname = "soccerdatabase",
+  host = "localhost",
+  user = "root",
+  password = "Jakelong99",
+  flags = CLIENT_LOCAL_FILES
+)
+
+wyscout_players_sl <- dbReadTable(con, "wyscout_players_sl")
+wyscout_matchevents_common_sl <- dbReadTable(con, "wyscout_matchevents_common_sl")
+wyscout_matchevents_shots_sl <- dbReadTable(con, "wyscout_matchevents_shots_sl")
+
+# Vi laver en ny df, som har alle de nødvendige data
+# Vi joiner wyscout_players_sl og wyscout_matchevents_common_sl på PLAYER_WYID
+
+# Vi sletter alle dubletter i players
+wyscout_players_sl <- wyscout_players_sl %>% 
+  distinct(PLAYER_WYID, .keep_all = TRUE)
+
+# Start med alle skud
+allshots <- wyscout_matchevents_shots_sl %>%
+  # Join med common-sl for at få fx location.x og y
+  left_join(wyscout_matchevents_common_sl, by = "EVENT_WYID") %>% 
+  # Join med player-info for at få navn, fod osv.
+  left_join(wyscout_players_sl, by = "PLAYER_WYID")
+
+# Sæson 23/24 = 188945
+
+# Da vi kun skal bruge data fra sæsonen 23/24 filtrere vi i vores sæson ID
+allshots <- allshots %>% 
+  filter(SEASON_WYID.x == 188945)
+
+# Sæson 24/25 = 189918 
+
+# ---------------------------------------------- #
+#           Aggregering af rolename              #
+# ---------------------------------------------- #
+
+#Original:
+# - Defender
+# - Midfielder
+# - Forward
+
+# Ny version (ROLEGROUP):
+#  - Other (Defender + Midfielder)
+#  - Forward
+
+# Fjern det ene skud en målmand har i datasæt 
+allshots <- allshots[allshots$ROLENAME != "Goalkeeper", ]
+
+#gør til faktor
+allshots$ROLENAME <- as.factor(allshots$ROLENAME)
+
+# flet midtbane og forsvar sammen i ny vairabel 
+allshots$ROLEGROUP <- ifelse(allshots$ROLENAME == "Forward", "Angriber", "Forsvar/Midtbane")
+allshots$ROLEGROUP <- as.factor(allshots$ROLEGROUP)
+
+
+
+# ---------------------------------------------- #
+#   Beregning af vinkel og afstand til mål       #
+# ---------------------------------------------- #
+
+# Funktion til beregning af vinkel til mål
+ca <- function(p)  {
+  player_x <- p[1]
+  player_y <- p[2]
+  
+  p1_x <- 100; p1_y <- 44  # Stolpe 1
+  p2_x <- 100; p2_y <- 56  # Stolpe 2
+  
+  V1_x <- p1_x - player_x; V1_y <- p1_y - player_y
+  V2_x <- p2_x - player_x; V2_y <- p2_y - player_y
+  
+  dot_product <- V1_x * V2_x + V1_y * V2_y
+  magnitude_V1 <- sqrt(V1_x^2 + V1_y^2)
+  magnitude_V2 <- sqrt(V2_x^2 + V2_y^2)
+  
+  cos_theta <- dot_product / (magnitude_V1 * magnitude_V2)
+  theta_rad <- acos(cos_theta)
+  theta_deg <- theta_rad * (180 / pi)
+  
+  return(theta_deg)
+}
+
+# Midtpunkt i målet
+goal_x <- 100
+goal_y <- 50
+
+# Tilføj vinkel og afstand
+allshots <- allshots %>%
+  rowwise() %>%
+  mutate(
+    ANGLE = ca(c(LOCATIONX, LOCATIONY)),
+    LENGTH = sqrt((goal_x - LOCATIONX)^2 + (goal_y - LOCATIONY)^2)
+  ) %>%
+  ungroup()
+
+# ------------------------------------------------------ #
+#   Opret variabel der angiver foretrukken fod           #
+# ------------------------------------------------------ #
+
+# Antag at FOOT er spillerens foretrukne fod (fx "left" eller "right")
+allshots <- allshots %>%
+  mutate(
+    SHOTBODYPART = case_when(
+      grepl("left", SHOTBODYPART) ~ "left",
+      grepl("right", SHOTBODYPART) ~ "right",
+      TRUE ~ SHOTBODYPART
+    ),
+    PREFERRED_FOOT = case_when(
+      SHOTBODYPART == "head_or_other" ~ "Non-Foot",
+      SHOTBODYPART == FOOT ~ "Preferred",
+      TRUE ~ "Non-Preferred"
+    ),
+    PREFERRED_FOOT = factor(PREFERRED_FOOT, levels = c("Preferred", "Non-Preferred", "Non-Foot"))
+  )
+
+
+allshots$PREFERRED_FOOT <- relevel(allshots$PREFERRED_FOOT, ref = "Preferred")
+
+
+# ---------------------------------------------- #
+#   Opdeling: Stratificeret sampling             #
+# ---------------------------------------------- #
+
+set.seed(123)
+
+splitIndex <- createDataPartition(allshots$SHOTISGOAL, p = 0.8, list = FALSE)
+train_data <- allshots[splitIndex, ]
+test_data <- allshots[-splitIndex, ]
+
+# Konverter relevante kolonner til faktorer
+train_data <- train_data %>%
+  mutate(SHOTISGOAL = as.factor(SHOTISGOAL),
+         SHOTBODYPART = as.factor(SHOTBODYPART),
+         SHOTBODYPART = as.factor(SHOTBODYPART))
+
+test_data <- test_data %>%
+  mutate(SHOTISGOAL = as.factor(SHOTISGOAL),
+         SHOTBODYPART = as.factor(SHOTBODYPART),
+         SHOTBODYPART = as.factor(SHOTBODYPART))
+
+
+# ---------------------------------------------- #
+#   Logistisk Regression                         #
+# ---------------------------------------------- #
+
+# Træn en simpel logistisk regressionsmodel
+log_model <- glm(SHOTISGOAL ~ LENGTH + ANGLE + SHOTBODYPART + PREFERRED_FOOT + ROLEGROUP,
+                 data = train_data, 
+                 family = binomial)
+
+# Vis modelresumé med p-værdier
+summary(log_model)
+
+# ---------------------------------------------- #
+#   Decision Tree Model                          #
+# ---------------------------------------------- #
+
+# Træn beslutningstræ
+tree_model <- rpart(SHOTISGOAL ~ LENGTH + ANGLE + SHOTBODYPART + PREFERRED_FOOT + ROLEGROUP,
+                    data = train_data, 
+                    method = "class")
+
+
+# Visualisér træet
+rpart.plot(tree_model, type = 3, extra = 101, fallen.leaves = TRUE)
+
+# ---------------------------------------------- #
+#   Random Forest Model                          #
+# ---------------------------------------------- #
+
+# Træn random forest-model
+rf_model <- randomForest(
+  SHOTISGOAL ~ LENGTH + ANGLE + SHOTBODYPART + PREFERRED_FOOT +  + PREFERRED_FOOT + ROLEGROUP,
+  data = train_data,
+  importance = TRUE,
+)
+
+# Vis træningsresultater for model på træning
+print(rf_model)
+
+# ---------------------------------------------- #
+#   Fejlrate pr. antal træer (Random Forest)     #
+# ---------------------------------------------- #
+
+rf_error <- data.frame(
+  Trees = 1:nrow(rf_model$err.rate),
+  Error = rf_model$err.rate[, "OOB"]
+)
+
+ggplot(rf_error, aes(x = Trees, y = Error)) +
+  geom_line(color = "#228", linewidth = 1.2) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major = element_line(color = "gray85"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(title = "Random Forest: Fejlrate vs. Antal Træer",
+       x = "Antal Træer", 
+       y = "Fejlrate (Misclassification Error)")
+
+# ---------------------------------------------- #
+#   Variabelvigtighed i Random Forest            #
+# ---------------------------------------------- #
+
+importance_rf <- data.frame(
+  Variable = rownames(importance(rf_model)), 
+  Importance = importance(rf_model)[, 1]
+)
+
+ggplot(importance_rf, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "#228", width = 0.7) +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major = element_line(color = "gray85"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(title = "Rolegroup har lavest variabelvigtighed",
+       x = "Variabel",
+       y = "Gini impurity (Variabels betydning)")
+
+# ---------------------------------------------- #
+#             Forudsig på test                   #
+# ---------------------------------------------- #
+
+# Forudsig sandsynlighed for mål på test_data
+test_data$predicted_prob_rf <- predict(rf_model, newdata = test_data, type = "prob")[, 2]
+
+# ---------------------------------------------- #
+#               Confusion Matrix                 #
+# ---------------------------------------------- #
+
+# Konverter målkolonne til numerisk
+test_data$SHOTISGOAL <- as.numeric(levels(test_data$SHOTISGOAL))[test_data$SHOTISGOAL]
+
+# Confusion Matrix med cutoff 
+test_data$predicted_goal_rf <- ifelse(test_data$predicted_prob_rf > 0.50, 1, 0)
+conf_matrix_rf <- table(Actual = test_data$SHOTISGOAL, Predicted = test_data$predicted_goal_rf)
+print(conf_matrix_rf)
+
+# ---------------------------------------------- #
+#               Root Squared Error               #
+# ---------------------------------------------- #
+
+#hvor tæt på 0 er resultatet? hvilket indikerer hvor præcis modellen er
+rse_rf <- sqrt(mean((test_data$SHOTISGOAL - test_data$predicted_prob_rf)^2))
+cat("Root Squared Error (RSE):", round(rse_rf, 4), "\n")
+
+# ---------------------------------------------- #
+#               ROC Curve og AUC                 #
+# ---------------------------------------------- #
+
+roc_curve <- roc(test_data$SHOTISGOAL, predict(rf_model, test_data, type = "prob")[, 2])
+plot(roc_curve)
+auc(roc_curve)
+
+
+# ---------------------------------------------- #
+#   10-Fold Cross-Validation af Random Forest    #
+# ---------------------------------------------- #
+
+cv_control <- trainControl(method = "cv", number = 10, sampling = "up")
+
+rf_model_cv <- train(SHOTISGOAL ~ LENGTH + ANGLE + SHOTBODYPART + PREFERRED_FOOT + ROLEGROUP, 
+                     data = train_data, 
+                     method = "rf",
+                     trControl = cv_control)
+
+# Resultater
+print(rf_model_cv)
+
+# ---------------------------------------------- #
+#   Fejlrate pr. antal træer Random Forest.CV    #
+# ---------------------------------------------- #
+
+rf_error_cv <- data.frame(
+  Trees = 1:nrow(rf_model_cv$finalModel$err.rate),
+  Error = rf_model_cv$finalModel$err.rate[, "OOB"]
+)
+
+
+ggplot(rf_error_cv, aes(x = Trees, y = Error)) +
+  geom_line(color = "#228", linewidth = 1.2) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major = element_line(color = "gray85"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(title = "Random Forest: Fejlrate vs. Antal Træer",
+       x = "Antal Træer", 
+       y = "Fejlrate (Misclassification Error)")
+
+# ---------------------------------------------- #
+#   Variabelvigtighed i Random Forest_CV         #
+# ---------------------------------------------- #
+
+importance_rf_xg <- data.frame(
+  Variable = rownames(importance(rf_model_cv$finalModel)), 
+  Importance = importance(rf_model_cv$finalModel)[, 1]
+)
+
+ggplot(importance_rf_xg, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "#228", width = 0.7) +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major = element_line(color = "gray85"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(title = "Nummeriske variable dominerer modellen",
+       x = "Variabel",
+       y = "Gini impurity (Variabels betydning)")
+
+# ---------------------------------------------- #
+#             Forudsig på test med CV            #
+# ---------------------------------------------- #
+
+# Forudsig sandsynligheder for mål (klasse 1)
+test_data$predicted_prob_rf_cv <- predict(rf_model_cv, newdata = test_data, type = "prob")[, 2]
+
+# Forudsigelse med cut off 
+test_data$predicted_goal_rf_cv <- ifelse(test_data$predicted_prob_rf_cv > 0.50, 1, 0)
+
+# ---------------------------------------------- #
+#   Cross-Validated Confusion Matrix             #
+# ---------------------------------------------- #
+
+# Sørg for at begge er faktorer med samme niveauer
+pred_rf <- factor(test_data$predicted_goal_rf_cv, levels = c(0, 1))
+actual <- factor(test_data$SHOTISGOAL, levels = c(0, 1))
+
+conf_matrix_cv <- confusionMatrix(pred_rf, actual)
+print(conf_matrix_cv)
+
+
+# ---------------------------------------------- #
+#               ROC Curve og AUC                 #
+# ---------------------------------------------- #
+
+roc_curve_cv <- roc(actual, test_data$predicted_prob_rf_cv)
+plot(roc_curve_cv, col = "#228", lwd = 2, main = "ROC-kurve – CV RF")
+auc(roc_curve_cv)
+
+
+# ---------------------------------------------- #
+#               Root Squared Error               #
+# ---------------------------------------------- #
+
+# Konverter evt. SHOTISGOAL til numerisk (hvis det ikke allerede er)
+actual_num <- as.numeric(as.character(test_data$SHOTISGOAL))
+
+#hvor tæt på 0 er resultatet? hvilket indikerer hvor præcis modellen er
+rse_cv <- sqrt(mean((actual_num - test_data$predicted_prob_rf_cv)^2))
+cat("Root Squared Error (RSE):", round(rse_cv, 4), "\n")
+
+
+# ---------------------------------------------- #
+#         Nu går vi over til XGBoost            #
+# ---------------------------------------------- #
+
+# ---------------------------------------------- #
+#       Forbered: målvariabel til XGBoost        #
+# ---------------------------------------------- #
+
+train_data_xg <- train_data %>%
+  mutate(
+    SHOTISGOAL_BIN = factor(ifelse(SHOTISGOAL == 1, "Yes", "No"), levels = c("No", "Yes"))
+  )
+
+test_data_xg <- test_data %>%
+  mutate(
+    SHOTISGOAL_BIN = factor(ifelse(SHOTISGOAL == 1, "Yes", "No"), levels = c("No", "Yes")),
+    SHOTISGOAL_NUM = as.numeric(as.character(SHOTISGOAL))  # til evt. AUC på originalt format
+  )
+
+# ---------------------------------------------- #
+#     Set-up: TrainControl med ROC-metrik        #
+# ---------------------------------------------- #
+
+# Xg boost køres altid med krydsvalidering, da
+# Den er designet til at finde de bedste parametre/regler gennem CV
+
+cv_control <- trainControl(
+  method = "cv",
+  number = 10,
+  sampling = "up",
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+# ---------------------------------------------- #
+#         Træn XGBoost med krydsvalidering       #
+# ---------------------------------------------- #
+
+
+xgb_model_cv <- train(
+  SHOTISGOAL_BIN ~ LENGTH + ANGLE + SHOTBODYPART + PREFERRED_FOOT + ROLEGROUP,
+  data = train_data_xg,
+  method = "xgbTree",
+  metric = "ROC",
+  trControl = cv_control
+)
+
+# Vis resultater
+print(xgb_model_cv)
+
+# ---------------------------------------------- #
+#   Udtræk importance fra finalModel i xg boost  #
+# ---------------------------------------------- #
+
+importance_matrix <- xgb.importance(
+  feature_names = xgb_model_cv$finalModel$feature_names,
+  model = xgb_model_cv$finalModel
+)
+
+print(importance_matrix)
+
+
+# ---------------------------------------------- #
+#      Forudsig & evaluer på test_data           #
+# ---------------------------------------------- #
+
+# 1. Forudsig sandsynligheder for klassen "Yes"
+test_data_xg$predicted_prob_xgb <- predict(xgb_model_cv, newdata = test_data_xg, type = "prob")[, "Yes"]
+
+# 2. Brug cutoff til at lave binær forudsigelse
+test_data_xg$predicted_goal_xgb <- ifelse(test_data_xg$predicted_prob_xgb > 0.50, "Yes", "No")
+
+# ---------------------------------------------- #
+#                Confusion Matrix                #
+# ---------------------------------------------- #
+
+conf_matrix_xgb <- confusionMatrix(
+  factor(test_data_xg$predicted_goal_xgb, levels = c("No", "Yes")),
+  test_data_xg$SHOTISGOAL_BIN
+)
+print(conf_matrix_xgb)
+
+# ---------------------------------------------- #
+#        📈 ROC Curve og AUC                     #
+# ---------------------------------------------- #
+
+roc_xgb <- roc(test_data_xg$SHOTISGOAL_BIN, test_data_xg$predicted_prob_xgb)
+plot(roc_xgb, col = "#D7263D", lwd = 2, main = "XGBoost ROC Curve")
+auc(roc_xgb)
+
+# ---------------------------------------------- #
+#       Plot af sandsynlighed ved xg boost       #
+# ---------------------------------------------- #
+
+# uden cut off værdi synligt
+ggplot(test_data_xg, aes(x = predicted_prob_xgb, fill = SHOTISGOAL_BIN)) +
+  geom_histogram(bins = 30, alpha = 0.5, position = "identity") +
+  labs(title = "Uforudsigeligheden i målscoring", x = "Sandsynlighed for mål", fill = "Mål")
+
+
+library(shiny)
+library(shinythemes)
+library(ggplot2)
+library(ggsoccer)
+
+# Læs din model og data ind
+xgb_model_cv <- readRDS("xgb_model_cv.rds")
+
+app_theme <- shinytheme("superhero")
+
+ui <- navbarPage(
+  theme = app_theme,
+  "xG Model Explorer",
+  
+  tabPanel("Skudanalyse",
+           fluidPage(
+             div(style = "background-color: #2c3e50; padding: 15px; color: white; text-align: center; font-size: 36px; font-weight: bold; padding-bottom: 20px;",
+                 "⚽ Forventet Målmodel (xG) Explorer"),
+             
+             sidebarLayout(
+               sidebarPanel(
+                 sliderInput("x", "Boldens X-position:", min = 0, max = 100, value = 80),
+                 sliderInput("y", "Boldens Y-position:", min = 0, max = 100, value = 50),
+                 selectInput("foot", "Skudtype (Fod):", 
+                             choices = c("right", "left", "head_or_other")),
+                 selectInput("preferred", "Foretrukken fod?", 
+                             choices = c("Preferred", "Non-Preferred", "Non-Foot")),
+                 selectInput("role", "Roller:", 
+                             choices = c("Angriber", "Forsvar/Midtbane"))
+               ),
+               mainPanel(
+                 div(style = "border: 10px solid black; border-radius: 15px; padding: 10px; background-color: #000; position: relative;", 
+                     plotOutput("pitch_plot", height = "700px"),
+                     absolutePanel(
+                       top = 20, right = 30, draggable = FALSE,
+                       div(style = "background-color: #111; padding: 10px 20px; border-radius: 10px; color: white; font-size: 24px; font-weight: bold;",
+                           textOutput("xg_output")
+                       )
+                     )
+                 )
+               )
+             )
+           )
+  )
+)
+
+server <- function(input, output, session) {
+  output$pitch_plot <- renderPlot({
+    ggplot() +
+      annotate_pitch(dimensions = pitch_wyscout, fill = "darkgreen", colour = "white") +
+      
+      # 🎯 Opdateret bold - hvid med sort kant
+      geom_point(aes(x = input$x, y = input$y), 
+                 shape = 21, fill = "yellow2", color = "black", size = 7) +
+      
+      coord_fixed(xlim = c(0, 100), ylim = c(0, 100)) +
+      theme_pitch()
+  })
+  
+  output$xg_output <- renderText({
+    # Beregn vinkel og afstand
+    goal_x <- 100
+    goal_y <- 50
+    
+    angle_calc <- function(x, y) {
+      p1 <- c(100, 44)
+      p2 <- c(100, 56)
+      v1 <- c(p1[1] - x, p1[2] - y)
+      v2 <- c(p2[1] - x, p2[2] - y)
+      cos_theta <- sum(v1 * v2) / (sqrt(sum(v1^2)) * sqrt(sum(v2^2)))
+      angle <- acos(cos_theta) * (180 / pi)
+      return(angle)
+    }
+    
+    angle <- angle_calc(input$x, input$y)
+    length <- sqrt((goal_x - input$x)^2 + (goal_y - input$y)^2)
+    
+    # Lav dataframe med inputs
+    new_data <- data.frame(
+      LENGTH = length,
+      ANGLE = angle,
+      SHOTBODYPART = input$foot,
+      PREFERRED_FOOT = input$preferred,
+      ROLEGROUP = input$role
+    )
+    
+    # Forudsig xG
+    xg_prob <- predict(xgb_model_cv, newdata = new_data, type = "prob")[, "Yes"]
+    paste0("xG (sandsynlighed for mål): ", round(xg_prob * 100, 2), "%")
+  })
+}
+
+shinyApp(ui, server)
+
+
+
+
