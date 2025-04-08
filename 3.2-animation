@@ -1,0 +1,190 @@
+saveRDS(players_clean, file = "~/Desktop/Dataanalyse/Semester2/Eksamen/Eksamensopgave/Opgave 3/Opgave3.2_Data/players_clean.rds")
+saveRDS(ball_clean, file = "~/Desktop/Dataanalyse/Semester2/Eksamen/Eksamensopgave/Opgave 3/Opgave3.2_Data/ball_clean.rds")
+
+# ---------------------------------------------------- #
+#         Indlæs nødvendige pakker og metadata         #
+# ---------------------------------------------------- #
+
+library(jsonlite)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggsoccer)
+library(lubridate)
+library(stringr)
+library(gganimate)
+library(purrr)
+
+# ---------------------------------------------------- #
+#     indlæs metadata.rds + tracking_data.rds først    #
+# ---------------------------------------------------- #
+
+# ---------------------------------------------------- #
+#                 styr på klokken                      #
+# ---------------------------------------------------- #
+
+# Tidspunkt for kampstart
+kickoff <- as.POSIXct(metadata$startTime / 1000, origin = "1970-01-01", tz = "Europe/Copenhagen")
+
+# Tilføj menneskelæselig kampklokke og fjern overflødige kolonner
+tracking_data <- tracking_data %>%
+  mutate(kamp_klokke = format(kickoff + seconds(gameClock), "%H:%M:%S"))
+
+
+# ---------------------------------------------------- #
+#       Filtrér trackingdata  omrking første mål       #
+# ---------------------------------------------------- #
+first_goal_tracking <- tracking_data %>%
+  filter(gameClock >= 1010 & gameClock <= 1850) %>%
+  filter(period == 1)
+
+# Flad strukturen ud for nem adgang til nested elementer
+first_goal_tracking <- fromJSON(toJSON(first_goal_tracking), flatten = TRUE)
+
+# ---------------------------------------------------- #
+# 2. Vælg gyldigt frame (seneste inden mål, hvor spillet er live)
+# ---------------------------------------------------- #
+
+frames_for_anim <- first_goal_tracking %>%
+  filter(frameIdx >= 36300 & frameIdx <= 36700) %>%
+  filter(live == TRUE)
+
+
+# ---------------------------------------------------- #
+# lav bold til 100,100 kordinator så vi kan finde mål  #
+# ---------------------------------------------------- #
+
+pitch_length <- 100
+pitch_width <- 100
+
+# Ekstrahér og konverter boldens koordinater for alle frames
+ball_all <- frames_for_anim %>%
+  select(frameIdx, ball.xyz) %>%
+  mutate(ball_str = as.character(ball.xyz)) %>%
+  mutate(ball_clean = str_remove_all(ball_str, "c\\(|\\)")) %>%
+  separate(ball_clean, into = c("x", "y", "z"), sep = ",") %>%
+  mutate(
+    x = as.numeric(trimws(x)) + pitch_length / 2,
+    y = as.numeric(trimws(y)) + pitch_width / 2,
+    z = as.numeric(trimws(z))
+  ) %>%
+  filter(!is.na(x), !is.na(y))
+
+
+# ---------------------------------------------------- #
+# 3. Træk spillerdata ud og konverter VBOB → ggsoccer
+# ---------------------------------------------------- #
+home <- frames_for_anim$homePlayers[[1]] %>% mutate(team = "Home")
+away <- frames_for_anim$awayPlayers[[1]] %>% mutate(team = "Away")
+
+players <- bind_rows(home, away)
+
+# Konverter og transformer koordinater
+pitch_length <- 100
+pitch_width <- 100
+
+players_clean <- frames_for_anim %>%
+  select(frameIdx, homePlayers, awayPlayers) %>%
+  rowwise() %>%
+  mutate(
+    home = list(mutate(homePlayers, team = "Home")),
+    away = list(mutate(awayPlayers, team = "Away"))
+  ) %>%
+  ungroup() %>%
+  mutate(players = map2(home, away, ~ bind_rows(.x, .y))) %>%
+  select(frameIdx, players) %>%
+  unnest(players) %>%
+  mutate(
+    xyz_str = as.character(xyz),
+    xyz_clean = str_remove_all(xyz_str, "c\\(|\\)"),
+    frameIdx = as.integer(frameIdx)
+  ) %>%
+  separate(xyz_clean, into = c("x", "y", "z"), sep = ",") %>%
+  mutate(
+    x = as.numeric(trimws(x)) + pitch_length / 2,
+    y = as.numeric(trimws(y)) + pitch_width / 2
+  ) %>%
+  filter(!is.na(x), !is.na(y))
+
+
+ball_clean <- frames_for_anim %>%
+  select(frameIdx, ball.xyz) %>%
+  mutate(
+    ball_str = as.character(ball.xyz),
+    ball_clean = str_remove_all(ball_str, "c\\(|\\)"),
+    frameIdx = as.integer(frameIdx)
+  ) %>%
+  separate(ball_clean, into = c("x", "y", "z"), sep = ",") %>%
+  mutate(
+    x = as.numeric(trimws(x)) + pitch_length / 2,
+    y = as.numeric(trimws(y)) + pitch_width / 2
+  ) %>%
+  filter(!is.na(x), !is.na(y))
+
+# ---------------------------------------------------- #
+# 5. Visualisér med ggsoccer animation time            #
+# ---------------------------------------------------- #
+
+p <- ggplot() +
+  annotate_pitch(dimensions = pitch_wyscout, fill = "darkgreen", colour = "white") +
+  geom_point(data = players_clean, aes(x = x, y = y, color = team, group = playerId), size = 3) +
+  geom_text(data = players_clean, aes(x = x, y = y, label = number, group = playerId), color = "white", size = 2.5, vjust = -1) +
+  geom_point(data = ball_clean, aes(x = x, y = y), fill = "black", shape = 21, color = "white", size = 4) +
+  coord_fixed(xlim = c(0, pitch_length), ylim = c(0, pitch_width)) +
+  theme_pitch() +
+  labs(title = "Målsekvens – Frame: {closest_state}") +
+  transition_states(frameIdx, transition_length = 1, state_length = 1) +
+  ease_aes('linear')
+
+animate(p, fps = 10, width = 800, height = 500)
+
+
+#Shiny 
+
+app_theme <- shinytheme("superhero")
+
+ui <- navbarPage(
+  theme = app_theme,
+  "xG Model Explorer",
+  
+  tabPanel("Målanimation",
+           fluidPage(
+             div(style = "background-color: #2c3e50; padding: 15px; color: white; text-align: center; font-size: 36px; font-weight: bold; padding-bottom: 20px;",
+                 "⚽ Animation af målsekvens"),
+             
+             # Wrapper der centrerer indholdet i midten
+             div(style = "display: flex; justify-content: center;",
+                 div(style = "border: 10px solid black; border-radius: 15px; padding: 10px; background-color: #000;",
+                     imageOutput("goal_animation", height = "500px", width = "800px")
+                 )
+             )
+           )
+  )
+)
+
+server <- function(input, output, session) {
+  output$goal_animation <- renderImage({
+    outfile <- tempfile(fileext = ".gif")
+    
+    p <- ggplot() +
+      annotate_pitch(dimensions = pitch_wyscout, fill = "darkgreen", colour = "white") +
+      geom_point(data = players_clean, aes(x = x, y = y, color = team, group = playerId), size = 3) +
+      geom_text(data = players_clean, aes(x = x, y = y, label = number, group = playerId), color = "white", size = 2.5, vjust = -1) +
+      geom_point(data = ball_clean, aes(x = x, y = y), fill = "black", shape = 21, color = "white", size = 4) +
+      coord_fixed(xlim = c(0, pitch_length), ylim = c(0, pitch_width)) +
+      theme_pitch() +
+      labs(title = "Målsekvens – Frame: {closest_state}") +
+      transition_states(frameIdx, transition_length = 1, state_length = 1) +
+      ease_aes('linear')
+    
+    anim_save(outfile, animation = animate(p, renderer = gifski_renderer(), fps = 10, width = 800, height = 500))
+    
+    list(src = outfile, contentType = 'image/gif')
+  }, deleteFile = TRUE)
+}
+
+shinyApp(ui, server)
+
+
+
+
