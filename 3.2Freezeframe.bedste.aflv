@@ -1,0 +1,238 @@
+library(tidyverse)
+library(ggsoccer)
+library(ggforce)
+
+# ---------------------------------------------------- #
+#     indlæs metadata.rds + tracking_data.rds først    #
+# ---------------------------------------------------- #
+# ---------------------------------------------------- #
+#                 styr på klokken                      #
+# ---------------------------------------------------- #
+
+# Tidspunkt for kampstart
+kickoff <- as.POSIXct(metadata$startTime / 1000, origin = "1970-01-01", tz = "Europe/Copenhagen")
+
+# Tilføj menneskelæselig kampklokke og fjern overflødige kolonner
+tracking_data <- tracking_data %>%
+  mutate(kamp_klokke = format(kickoff + seconds(gameClock), "%H:%M:%S"))
+
+# ---------------------------------------------------- #
+#       Filtrér trackingdata  omrking første mål       #
+# ---------------------------------------------------- #
+
+first_goal_tracking <- tracking_data %>%
+  filter(gameClock >= 1010 & gameClock <= 1850) %>%
+  filter(period == 1)
+
+# Flad strukturen ud for nem adgang til nested elementer
+first_goal_tracking <- fromJSON(toJSON(first_goal_tracking), flatten = TRUE)
+
+# ---------------------------------------------------- #
+#       Filtrér trackingdata  omrking første mål       #
+# ---------------------------------------------------- #
+frame_for_freeze <- first_goal_tracking %>%
+  filter(frameIdx == 36410, live == TRUE)
+
+# ---------------------------------------------------- #
+#       Filtrér afvlering som fører til mål            #
+# ---------------------------------------------------- #
+
+# ----------- Basisparametre -----------
+pitch_length <- 100
+pitch_width <- 100
+shadow_length <- 60
+shadow_angle <- 25
+
+# ---------------------------------------------------- #
+# lav bold til 100,100 kordinator så vi kan finde mål  #
+# ---------------------------------------------------- #
+
+# Ekstrahér og konverter boldens koordinater for alle frames
+ball_all <- frame_for_freeze %>%
+  select(frameIdx, ball.xyz) %>%
+  mutate(ball_str = as.character(ball.xyz)) %>%
+  mutate(ball_clean = str_remove_all(ball_str, "c\\(|\\)")) %>%
+  separate(ball_clean, into = c("x", "y", "z"), sep = ",") %>%
+  mutate(
+    x = as.numeric(trimws(x)) + pitch_length / 2,
+    y = as.numeric(trimws(y)) + pitch_width / 2,
+    z = as.numeric(trimws(z))
+  ) %>%
+  filter(!is.na(x), !is.na(y))
+
+# ---------------------------------------------------- #
+#                     Boldposition                     #
+# ---------------------------------------------------- #
+
+ball_x <- ball_all$x
+ball_y <- ball_all$y
+
+# ---------------------------------------------------- #
+#               Covering Shadow Funktion               #
+# ---------------------------------------------------- #
+
+create_shadow_polygon <- function(player_x, player_y, ball_x, ball_y, width = 2) {
+  dx <- player_x - ball_x
+  dy <- player_y - ball_y
+  norm <- sqrt(dx^2 + dy^2)
+  ux <- dx / norm
+  uy <- dy / norm
+  vx <- -uy
+  vy <- ux
+  
+  data.frame(
+    shadow_x = c(ball_x, player_x + vx * width, player_x - vx * width),
+    shadow_y = c(ball_y, player_y + vy * width, player_y - vy * width)
+  )
+}
+
+players_all <- frame_for_freeze %>%
+  select(frameIdx, homePlayers, awayPlayers) %>%
+  rowwise() %>%
+  mutate(
+    home = list(mutate(homePlayers, team = "Home")),
+    away = list(mutate(awayPlayers, team = "Away"))
+  ) %>%
+  ungroup() %>%
+  mutate(players = map2(home, away, ~ bind_rows(.x, .y))) %>%
+  select(frameIdx, players) %>%
+  unnest(players) %>%
+  mutate(
+    xyz_str = as.character(xyz),
+    xyz_clean = str_remove_all(xyz_str, "c\\(|\\)"),
+    frameIdx = as.integer(frameIdx)
+  ) %>%
+  separate(xyz_clean, into = c("x", "y", "z"), sep = ",") %>%
+  mutate(
+    x = as.numeric(trimws(x)) + pitch_length / 2,
+    y = as.numeric(trimws(y)) + pitch_width / 2
+  ) %>%
+  filter(!is.na(x), !is.na(y))
+
+
+# ----------- Udvælg modspillere -----------
+away_players <- players_all %>% filter(team == "Away")
+
+# ----------- Byg alle shadows ----------- ( kun til 1 frame)
+# Generer shadows med playerId med i hver polygon
+shadows <- away_players %>%
+  rowwise() %>%
+  mutate(shadow = list(
+    create_shadow_polygon(x, y, ball_x, ball_y, width = 2) %>%
+      mutate(playerId = playerId)  # tag ID med videre
+  )) %>%
+  pull(shadow) %>%
+  bind_rows()
+
+# Find spilleren tættest på bolden
+players_all <- players_all %>%
+  mutate(distance_to_ball = sqrt((x - ball_x)^2 + (y - ball_y)^2))
+
+# Marker boldholder
+ball_holder <- players_all %>%
+  filter(distance_to_ball == min(distance_to_ball)) %>%
+  slice(1)  # hvis der er to med samme afstand
+
+# Alternativt, til at tilføje et "has_ball"-flag:
+players_all <- players_all %>%
+  mutate(has_ball = ifelse(playerId == ball_holder$playerId, TRUE, FALSE))
+
+
+# ----------- Bestem "bedste" spiller (progression mod mål) -----------
+away_players <- players_all %>%
+  filter(team == "Away") %>%
+  filter(playerId != ball_holder$playerId)  # Udeluk boldholderen
+
+goal_x <- 100
+goal_y <- 50
+
+away_players <- away_players %>%
+  mutate(distance_to_goal = sqrt((goal_x - x)^2 + (goal_y - y)^2))
+
+best_pass <- away_players %>%
+  filter(x < ball_x) %>%  # fremadrettet aflevering
+  slice_min(distance_to_goal, n = 1)
+
+# ----------- Boldens modtager – spiller 29 -----------
+actual_pass <- players_all %>% filter(number == 29)
+
+# ----------- Plot -----------
+ggplot() +
+  annotate_pitch(dimensions = pitch_wyscout, fill = "darkgreen", colour = "white") +
+  
+  # Covering shadows
+  geom_polygon(
+    data = shadows,
+    aes(x = shadow_x, y = shadow_y, group = interaction(playerId)),
+    fill = "black", alpha = 0.3
+  ) +
+  
+  # Spillere og bold
+  geom_point(data = players_all, aes(x = x, y = y, color = team), size = 4) +
+  geom_text(data = players_all, aes(x = x, y = y, label = number),
+            color = "white", size = 3, vjust = -1) +
+  geom_point(data = ball_all, aes(x = x, y = y),
+             color = "white", size = 5, shape = 21, fill = "black") +
+  
+  # Fremhæv boldholder
+  geom_point(data = players_all %>% filter(has_ball),
+             aes(x = x, y = y),
+             shape = 21, fill = "yellow", size = 3, stroke = 1.5, color = "black") +
+  
+  # Faktisk aflevering
+  geom_curve(data = actual_pass, aes(x = ball_x, y = ball_y, xend = x, yend = y),
+             arrow = arrow(length = unit(0.25, "cm")), color = "white", curvature = 0.15, linewidth = 1.2) +
+  
+  # Bedste aflevering
+  geom_curve(data = best_pass, aes(x = ball_x, y = ball_y, xend = x, yend = y),
+             arrow = arrow(length = unit(0.25, "cm")), color = "#66FF66", curvature = 0.15, linewidth = 1.2) +
+  
+  coord_fixed(xlim = c(0, pitch_length), ylim = c(0, pitch_width)) +
+  theme_pitch() +
+  labs(title = "Illustration af bedste aflervering (grøn) og faktiske (hvid)") +
+  theme(plot.title = element_text(hjust = 0.5, size = 18))
+
+
+
+ggplot() +
+  # Banen
+  annotate_pitch(dimensions = pitch_wyscout, fill = "darkgreen", colour = "white") +
+  
+  # Skuggede områder
+  geom_polygon(
+    data = shadows,
+    aes(x = shadow_x, y = shadow_y, group = interaction(playerId)),
+    fill = "black", alpha = 0.3
+  ) +
+  
+  # Spillere
+  geom_point(data = players_all, aes(x = x, y = y, color = team), size = 4) +
+  geom_text(data = players_all, aes(x = x, y = y, label = number),
+            color = "white", size = 3, vjust = -1) +
+  
+  # Bold
+  geom_point(data = ball_all, aes(x = x, y = y),
+             color = "white", size = 5, shape = 21, fill = "black") +
+  
+  # Fremhæv boldholder med farve som holdet
+  geom_point(data = players_all %>% filter(has_ball),
+             aes(x = x, y = y, color = team),
+             size = 6, shape = 1, stroke = 1.5) +
+  
+  # Faktisk aflevering
+  geom_curve(data = actual_pass, aes(x = ball_x, y = ball_y, xend = x, yend = y),
+             arrow = arrow(length = unit(0.25, "cm")), color = "white", curvature = 0.15, linewidth = 1.2) +
+  
+  # Bedste aflevering
+  geom_curve(data = best_pass, aes(x = ball_x, y = ball_y, xend = x, yend = y),
+             arrow = arrow(length = unit(0.25, "cm")), color = "#66FF66", curvature = 0.15, linewidth = 1.2) +
+  
+  # Koordinater og tema
+  coord_fixed(xlim = c(0, pitch_length), ylim = c(0, pitch_width)) +
+  theme_pitch() +
+  
+  # Titel
+  labs(title = "Illustration af bedste aflevering (grøn) og faktiske (hvid)") +
+  theme(plot.title = element_text(hjust = 0.5, size = 18))
+
+
