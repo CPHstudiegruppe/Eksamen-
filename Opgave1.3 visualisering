@@ -1,0 +1,444 @@
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(dplyr)
+library(randomForest)
+library(ggplot2)
+library(stringr)
+library(pROC)
+library(ggsoccer)
+library(xgboost)
+library(themis)
+
+{
+
+# Opret forbindelse til databasen
+con <- dbConnect(
+  drv = MariaDB(),
+  dbname = "soccerdatabase",
+  host = "localhost",
+  user = "root",
+  password = "Jakelong99",
+  flags = CLIENT_LOCAL_FILES
+)
+
+wyscout_players_sl <- dbReadTable(con, "wyscout_players_sl")
+wyscout_matchevents_common_sl <- dbReadTable(con, "wyscout_matchevents_common_sl")
+wyscout_matchevents_shots_sl <- dbReadTable(con, "wyscout_matchevents_shots_sl")
+
+# Vi laver en ny df, som har alle de nødvendige data
+# Vi joiner wyscout_players_sl og wyscout_matchevents_common_sl på PLAYER_WYID
+
+# Vi sletter alle dubletter i players
+wyscout_players_sl <- wyscout_players_sl %>% 
+  distinct(PLAYER_WYID, .keep_all = TRUE)
+
+# Start med alle skud
+allshots <- wyscout_matchevents_shots_sl %>%
+  # Join med common-sl for at få fx location.x og y
+  left_join(wyscout_matchevents_common_sl, by = "EVENT_WYID") %>% 
+  # Join med player-info for at få navn, fod osv.
+  left_join(wyscout_players_sl, by = "PLAYER_WYID")
+
+# Sæson 23/24 = 188945
+
+# Da vi kun skal bruge data fra sæsonen 23/24 filtrere vi i vores sæson ID
+allshots <- allshots %>% 
+  filter(SEASON_WYID.x == 188945)
+
+# Sæson 24/25 = 189918 
+
+# ---------------------------------------------- #
+#   Beregning af vinkel og afstand til mål       #
+# ---------------------------------------------- #
+
+# Funktion til beregning af vinkel til mål
+ca <- function(p)  {
+  player_x <- p[1]
+  player_y <- p[2]
+  
+  p1_x <- 100; p1_y <- 44  # Stolpe 1
+  p2_x <- 100; p2_y <- 56  # Stolpe 2
+  
+  V1_x <- p1_x - player_x; V1_y <- p1_y - player_y
+  V2_x <- p2_x - player_x; V2_y <- p2_y - player_y
+  
+  dot_product <- V1_x * V2_x + V1_y * V2_y
+  magnitude_V1 <- sqrt(V1_x^2 + V1_y^2)
+  magnitude_V2 <- sqrt(V2_x^2 + V2_y^2)
+  
+  cos_theta <- dot_product / (magnitude_V1 * magnitude_V2)
+  theta_rad <- acos(cos_theta)
+  theta_deg <- theta_rad * (180 / pi)
+  
+  return(theta_deg)
+}
+
+# Midtpunkt i målet
+goal_x <- 100
+goal_y <- 50
+
+# Tilføj vinkel og afstand
+allshots <- allshots %>%
+  rowwise() %>%
+  mutate(
+    ANGLE = ca(c(LOCATIONX, LOCATIONY)),
+    LENGTH = sqrt((goal_x - LOCATIONX)^2 + (goal_y - LOCATIONY)^2)
+  ) %>%
+  ungroup()
+
+# ---------------------------------------------- #
+#     Standardisér skudfod og præference         #
+# ---------------------------------------------- #
+
+allshots <- allshots %>%
+  mutate(
+    SHOTBODYPART = case_when(
+      grepl("left", SHOTBODYPART) ~ "left",
+      grepl("right", SHOTBODYPART) ~ "right",
+      TRUE ~ SHOTBODYPART
+    ),
+    PREFERRED_FOOT = case_when(
+      SHOTBODYPART == "head_or_other" ~ "Non-Foot",
+      SHOTBODYPART == FOOT ~ "Preferred",
+      TRUE ~ "Non-Preferred"
+    ),
+    PREFERRED_FOOT = as.factor(PREFERRED_FOOT),
+    shot_bodyPart = as.factor(case_when(
+      SHOTBODYPART %in% c("left", "right") ~ "foot",
+      SHOTBODYPART == "head_or_other" ~ "head",
+      TRUE ~ "other"
+    ))
+  )
+
+allshots$PREFERRED_FOOT <- relevel(allshots$PREFERRED_FOOT, ref = "Preferred")
+
+}
+
+# ---------------------------------------------- #
+#   Grafisk og statistisk beskrivelse            #
+# ---------------------------------------------- #
+
+# Histogram: Vinkel
+ggplot(allshots, aes(x = ANGLE)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = median(allshots$ANGLE, na.rm = TRUE), color = "red", linetype = "dashed", linewidth = 1) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Høj koncentration af skud i intervallet 10–40°",
+    x = "Vinkel til mål (grader)",
+    y = "Antal skud"
+  ) +
+  annotate("text", x = median(allshots$ANGLE, na.rm = TRUE) + 5, y = max(table(cut(allshots$ANGLE, 50))), 
+           label = paste("Median:", round(median(allshots$ANGLE, na.rm = TRUE), 1), "°"), 
+           color = "red", hjust = 0)
+
+# ---------------------------------------------- #
+#     🎯 Visualisering af skud med 28,5° vinkel  #
+# ---------------------------------------------- #
+
+# Find en position fra allshots med vinkel tæt på 28.5°
+skud_285 <- allshots %>%
+  filter(!is.na(ANGLE)) %>%
+  filter(abs(ANGLE - 28.5) < 0.2) %>%
+  head(1)
+
+# Udpak koordinater
+x0 <- skud_285$LOCATIONX
+y0 <- skud_285$LOCATIONY
+vinkel <- round(skud_285$ANGLE, 1)
+
+# Målstolper
+goal_left <- c(100, 44)
+goal_right <- c(100, 56)
+
+# Beregn vinkelben
+v1 <- goal_left - c(x0, y0)
+v2 <- goal_right - c(x0, y0)
+v_mid <- (v1 + v2) / 2
+angle_mid <- atan2(v_mid[2], v_mid[1])
+
+half_angle <- vinkel / 2
+radius <- 30
+
+theta1 <- angle_mid - (half_angle * pi / 180)
+theta2 <- angle_mid + (half_angle * pi / 180)
+
+x1 <- x0 + radius * cos(theta1)
+y1 <- y0 + radius * sin(theta1)
+
+x2 <- x0 + radius * cos(theta2)
+y2 <- y0 + radius * sin(theta2)
+
+# Polygon-koordinater
+vinkel_felt <- data.frame(
+  x = c(x0, x1, x2),
+  y = c(y0, y1, y2)
+)
+
+# Plot fra spillerens syn
+ggplot() +
+  annotate_pitch(dimensions = pitch_wyscout, fill = "darkgreen", colour = "white") +
+  geom_polygon(data = vinkel_felt, aes(x = x, y = y), fill = "white", alpha = 0.3) +
+  geom_segment(aes(x = x0, y = y0, xend = goal_left[1], yend = goal_left[2]),
+               color = "white", linewidth = 1) +
+  geom_segment(aes(x = x0, y = y0, xend = goal_right[1], yend = goal_right[2]),
+               color = "white", linewidth = 1) +
+  geom_point(aes(x = x0, y = y0), color = "#D7263D", size = 6) +
+  annotate("text", x = x0 - 5, y = y0 + 5,
+           label = paste0("Vinkel ≈ ", vinkel, "°"),
+           color = "white", size = 6, fontface = "bold") +
+  coord_fixed(xlim = c(x0 - 20, 101), ylim = c(0, 100)) +
+  theme_pitch() +
+  labs(title = paste0("Visualisering af et skud med. ", vinkel, "° vinkel ti🤨l målet")) +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
+
+# ---------------------------------------------- #
+#     🎯 Visualisering af skud længde            #
+# ---------------------------------------------- #
+
+# Beregn median fra dine faktiske data
+median_length <- median(allshots$LENGTH, na.rm = TRUE)
+
+# Midtpunkt i målet
+goal_x <- 100
+goal_y <- 50
+
+# Bredde på målet (standard: 7.32 m), så stolper:
+goal_width <- 12
+goal_left_y <- goal_y - goal_width / 2
+goal_right_y <- goal_y + goal_width / 2
+
+# Generér buens punkter (vinkelbredde afhænger af længde og mål)
+theta <- seq(-asin(goal_width / 2 / median_length), asin(goal_width / 2 / median_length), length.out = 100)
+x_arc <- goal_x - median_length * cos(theta)
+y_arc <- goal_y + median_length * sin(theta)
+bue <- data.frame(x = x_arc, y = y_arc)
+
+# Tegn
+ggplot() +
+  annotate_pitch(dimensions = pitch_wyscout, fill = "darkgreen", colour = "white") +
+  geom_segment(aes(x = goal_x, y = goal_left_y, xend = goal_x, yend = goal_right_y),
+               color = "white", linewidth = 2) +
+  geom_line(data = bue, aes(x = x, y = y), color = "red", linewidth = 1.5) +
+  geom_ribbon(data = bue, aes(x = x, ymin = y, ymax = goal_y), fill = "red", alpha = 0.2) +
+  annotate("text", x = goal_x - median_length - 3, y = goal_y + 6,
+           label = paste0("Medianafstand ≈ ", round(median_length, 1), " meter"),
+           color = "white", size = 5, fontface = "bold") +
+  coord_fixed(xlim = c(60, 101), ylim = c(30, 70)) +
+  theme_pitch() +
+  labs(title = "Visualisering af medianafstand fra spiller til målet") +
+  theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
+
+# ---------------------------------------------- #
+#           Aggregering af rolename              #
+# ---------------------------------------------- #
+
+#Original:
+# - Defender
+# - Midfielder
+# - Forward
+
+# Ny version (ROLEGROUP):
+#  - Other (Defender + Midfielder)
+#  - Forward
+
+# Fjern det ene skud en målmand har i datasæt 
+allshots <- allshots[allshots$ROLENAME != "Goalkeeper", ]
+
+#gør til faktor
+allshots$ROLENAME <- as.factor(allshots$ROLENAME)
+
+# flet midtbane og forsvar sammen i ny vairabel 
+allshots$ROLEGROUP <- ifelse(allshots$ROLENAME == "Forward", "Forward", "Other")
+allshots$ROLEGROUP <- as.factor(allshots$ROLEGROUP)
+
+
+# ---------------------------------------------- #
+#         Scoringsrate efter kropsdel            #
+# ---------------------------------------------- #
+# Beregn scoringsrate
+scoring_stats <- allshots %>%
+  group_by(SHOTBODYPART) %>%
+  summarise(
+    antal_skud = n(),
+    mål = sum(SHOTISGOAL),
+    scoringsrate = round(mean(SHOTISGOAL), 3)
+  )
+
+ggplot(scoring_stats, aes(x = reorder(SHOTBODYPART, -scoringsrate), y = scoringsrate)) +
+  geom_col(fill = "steelblue", color = "white", alpha = 0.8, show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(scoringsrate * 100, 1), "%")), 
+            vjust = -0.5, size = 4.5, color = "red", fontface = "bold") +
+  labs(
+    title = "Højre fod har lavest scoringsprocent",
+    x = "Kropsdel",
+    y = "Scoringsprocent"
+  ) +
+  ylim(0, 0.40) +
+  theme_minimal(base_size = 14)
+
+
+# Beregn mål og antal
+scoring_stats <- allshots %>%
+  group_by(SHOTBODYPART) %>%
+  summarise(
+    antal_skud = n(),
+    mål = sum(SHOTISGOAL),
+    scoringsrate = round(mean(SHOTISGOAL), 3)
+  )
+
+# Plot antal mål
+ggplot(scoring_stats, aes(x = reorder(SHOTBODYPART, -mål), y = mål)) +
+  geom_col(fill = "steelblue", color = "white", alpha = 0.8, show.legend = FALSE) +
+  geom_text(aes(label = mål), vjust = -0.5, size = 5, color = "red", fontface = "bold") +
+  labs(
+    title = "Flest mål scores med foden",
+    x = "Kropsdel",
+    y = "Antal mål"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+# ---------------------------------------------- #
+#       Scoringsrate efter preferred foot        #
+# ---------------------------------------------- #
+# Beregn scoringsrate
+scoring_stats <- allshots %>%
+  group_by(PREFERRED_FOOT) %>%
+  summarise(
+    antal_skud = n(),
+    mål = sum(SHOTISGOAL),
+    scoringsrate = round(mean(SHOTISGOAL), 3)
+  )
+
+# Plot
+ggplot(scoring_stats, aes(x = reorder(PREFERRED_FOOT, -scoringsrate), y = scoringsrate)) +
+  geom_col(fill = "steelblue", color = "white", alpha = 0.8, show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(scoringsrate * 100, 1), "%")), 
+            vjust = -0.5, size = 4.5, color = "red", fontface = "bold") +
+  labs(
+    title = "Foretrukken fod har lavest scoringsprocent",
+    x = "Foretrukken eller ej",
+    y = "Scoringsprocent"
+  ) +
+  ylim(0, 0.40) +
+  theme_minimal(base_size = 14)
+
+
+
+# Beregn mål og antal
+scoring_stats <- allshots %>%
+  group_by(PREFERRED_FOOT) %>%
+  summarise(
+    antal_skud = n(),
+    mål = sum(SHOTISGOAL),
+    scoringsrate = round(mean(SHOTISGOAL), 3)
+  )
+
+# Plot antal mål
+
+
+ggplot(scoring_stats, aes(x = reorder(PREFERRED_FOOT, -mål), y = mål)) +
+  geom_col(fill = "steelblue", color = "white", alpha = 0.8, show.legend = FALSE) +
+  geom_text(aes(label = mål), vjust = -0.5, size = 5, color = "red", fontface = "bold") +
+  labs(
+    title = "Flest mål scores med den foretrukkne fod",
+    x = "Foretrukken eller ej",
+    y = "Antal mål"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+
+
+# ---------------------------------------------- #
+#   ⚽ Wyscout pitch heatmap                     #
+# ---------------------------------------------- #
+ggplot(allshots) +
+  annotate_pitch(dimensions = pitch_wyscout, fill = "darkgreen", colour = "white") +
+  stat_density2d(aes(x = LOCATIONX, y = LOCATIONY, fill = after_stat(density)),
+                 geom = "tile", contour = FALSE, alpha = 0.7) +
+  scale_fill_viridis_c(option = "D") +
+  coord_fixed(xlim = c(0, 100), ylim = c(0, 100)) +
+  theme_pitch() +
+  labs(title = "Skud heatmap – Wyscout pitch (tile version)",
+       fill = "Tæthed") +
+  theme(legend.position = "right")
+
+# ---------------------------------------------- #
+#         ⚽ StatsBomb pitch heatmap             #
+# ---------------------------------------------- #
+# Reskaler dine skud til StatsBomb koordinater (120x80)
+to_statsbomb <- rescale_coordinates(from = pitch_wyscout, to = pitch_statsbomb)
+
+shots_sb <- allshots %>%
+  mutate(
+    x = to_statsbomb$x(LOCATIONX),
+    y = to_statsbomb$y(LOCATIONY)
+  )
+
+ggplot(shots_sb) +
+  annotate_pitch(dimensions = pitch_statsbomb, fill = "springgreen4", colour = "white") +
+  stat_density2d(aes(x = x, y = y, fill = after_stat(density)),
+                 geom = "raster", contour = FALSE, alpha = 0.7) +
+  scale_fill_viridis_c(option = "C") +
+  coord_fixed(xlim = c(0, 120), ylim = c(0, 80)) +
+  theme_pitch() +
+  labs(title = "Flest skud på sidste 3. del af banen i midten",
+       fill = "Tæthed") +
+  theme(legend.position = "right")
+
+# ---------------------------------------------- #
+#                 Scoringsrate                   #
+# ---------------------------------------------- #
+
+# Beregn scoringsrate
+scoring_stats_role <- allshots %>%
+  group_by(ROLENAME) %>%
+  summarise(
+    mål = sum(SHOTISGOAL),
+    antal_skud = n(),
+    scoringsrate = round(mean(SHOTISGOAL), 3)
+  ) %>%
+  mutate(label = paste0(round(scoringsrate * 100, 1), "%"))
+
+# Plot 1
+ggplot(scoring_stats_role, aes(x = reorder(ROLENAME, -scoringsrate), y = scoringsrate)) +
+  geom_col(fill = "#4A7BA7", color = "white", alpha = 0.8) +
+  geom_text(aes(label = label), vjust = -0.5, color = "red", size = 5, fontface = "bold") +
+  labs(
+    title = "Ikke stor forskel på midtbane og forsvar",
+    x = "Rolle",
+    y = "Scoringsprocent"
+  ) +
+  ylim(0, 0.3) +
+  theme_minimal(base_size = 14)
+
+# Beregn scoringsrate
+scoring_stats_group <- allshots %>%
+  group_by(ROLEGROUP) %>%
+  summarise(
+    mål = sum(SHOTISGOAL),
+    antal_skud = n(),
+    scoringsrate = round(mean(SHOTISGOAL), 3)
+  ) %>%
+  mutate(label = paste0(round(scoringsrate * 100, 1), "%"))
+
+# Plot 2
+ggplot(scoring_stats_group, aes(x = ROLEGROUP, y = scoringsrate)) +
+  geom_col(fill = "#4A7BA7", color = "white", alpha = 0.8) +
+  geom_text(aes(label = label), vjust = -0.5, color = "red", size = 5, fontface = "bold") +
+  labs(
+    title = "Scoringsprocent – Angribere er mest effektive",
+    x = "Rollegruppe",
+    y = "Scoringsprocent"
+  ) +
+  ylim(0, 0.3) +
+  theme_minimal(base_size = 14)
+
+
+
+
+
+
